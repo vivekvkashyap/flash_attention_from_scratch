@@ -29,49 +29,60 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define softmax_scale 0.125 // (1 / 64)
 
-// void cpu_multi_head_attn(float *c_Q, float *c_K, float *c_V, float *c_O){
-//     int bs = batch_size;
-//     int n_h = n_head;
-//     int s_l = sequence_length;
-//     int h_d = head_dim;
-
-//     float *S = (float*)malloc(bs * n_h * s_l * s_l * sizeof(float));
-//     float *P = (float*)malloc(bs * n_h * s_l * s_l * sizeof(float));
-
-//     for (int i = 0; i < bs; i++){
-//         for (int j = 0; j < n_h; j++){
-
-
-//             for (int k = 0; k < s_l; k++){
-//                 for (int x = 0; x < s_l; x++){
-//                     float tmp = 0.0;
-//                     for (int l = 0; l < h_d; l++){
-//                         tmp += c_Q[i * (n_h * s_l * h_d) + j * (s_l * h_d) + k * (h_d) + l] * c_K[i * (n_h * s_l * h_d) + j * (s_l * h_d)  + l * (h_d) + x];
-//                     }
-//                 }
-//             }
-//             c_S[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + x] = tmp;
+void cpu_multi_head_attn(float *c_Q, float *c_K, float *c_V, float *c_O){
+    int bs = batch_size;
+    int n_h = n_head;
+    int s_l = sequence_length;
+    int h_d = head_dim;
+    
+    float *S = (float*)malloc(bs * n_h * s_l * s_l * sizeof(float));
+    float *P = (float*)malloc(bs * n_h * s_l * s_l * sizeof(float));
+    
+    for (int i = 0; i < bs; i++){
+        for (int j = 0; j < n_h; j++){
             
+            for (int k = 0; k < s_l; k++){        
+                for (int l = 0; l < s_l; l++){    
+                    float tmp = 0.0;
+                    for (int d = 0; d < h_d; d++){ 
+                        float q_val = c_Q[i * (n_h * s_l * h_d) + j * (s_l * h_d) + k * (h_d) + d];
+                        float k_val = c_K[i * (n_h * s_l * h_d) + j * (s_l * h_d) + l * (h_d) + d];
+                        tmp += q_val * k_val;
+                    }
+                    S[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + l] = tmp;
+                }
+            }
+            
+            for (int k = 0; k < s_l; k++){        
+                
+                float denominator = 0.0;
+                for (int l = 0; l < s_l; l++){    
+                    denominator += exp(S[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + l]);
+                }
+                
+                for (int l = 0; l < s_l; l++){    
+                    P[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + l] = 
+                        exp(S[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + l]) / denominator;
+                }
+            }
+            
+            for (int k = 0; k < s_l; k++){        
+                for (int d = 0; d < h_d; d++){    
+                    float tmp2 = 0.0;
+                    for (int l = 0; l < s_l; l++){
+                        float p_val = P[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + l];
+                        float v_val = c_V[i * (n_h * s_l * h_d) + j * (s_l * h_d) + l * (h_d) + d];
+                        tmp2 += p_val * v_val;
+                    }
+                    c_O[i * (n_h * s_l * h_d) + j * (s_l * h_d) + k * (h_d) + d] = tmp2;
+                }
+            }
+        }
+    }
 
-//             float denominator = 0.0;
-//             for (int u = 0; u < s_l; u++){
-//                 denominator+= exp(c_S[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + u]);
-//             }
-
-//             for (int b = 0; b < s_l; b++){
-//                 c_P[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + b] = exp(c_S[i * (n_h * s_l * s_l) + j * (s_l * s_l) + k * (s_l) + b]) / denominator;
-//             }
-
-//             for (int y = 0; y < h_d; y++){
-//                 float tmp2 = 0.0;
-//                 for (int q = 0; q < s_l; q++){
-//                     tmp2 += c_P[i * (n_h * s_l * s_l) + j * (s_l * s_l) + y * (s_l) + q] * c_V[i * (n_h * s_l * s_l) + j * (s_l * s_l) + q * (h_d) + y];
-//                 }
-//                 c_O[i * (n_h * s_l * h_d) + j * (s_l * h_d) +  q * (h_d) + y ] = tmp2;
-//             }
-//         }
-//     }
-// }
+    free(S);
+    free(P);
+}
 
 
 __global__ void multi_head_attention(float *d_q, float *d_k, float *d_v, float *d_S, float *d_P, float *d_o){
@@ -246,185 +257,188 @@ __global__ void flash_attn_kernel_1(float *d_q, float *d_k, float *d_v, float *d
     }
 }
 
-__global__ void flash_attn_backward_kernel_1(float *d_q, float *d_k, float *d_v, float *d_o, float *d_l, float *d_m, float *back_q, float *back_k, float *back_v, float *back_o){
+//  using way too much shared memory and back_S should be shared and not calculated for each row
+// __global__ void flash_attn_backward_kernel_1(float *d_q, float *d_k, float *d_v, float *d_o, float *d_l, float *d_m, float *back_q, float *back_k, float *back_v, float *back_o){
 
-    __shared__ float k_shared[Bc * head_dim];
-    __shared__ float v_shared[Bc * head_dim];
-    __shared__ float q_shared[Br * head_dim];
-    __shared__ float o_shared[Br * head_dim];
-    // __shared__ float l_shared[Br];
-    // __shared__ float m_shared[Br];
+//     __shared__ float k_shared[Bc * head_dim];
+//     __shared__ float v_shared[Bc * head_dim];
+//     __shared__ float q_shared[Br * head_dim];
+//     __shared__ float o_shared[Br * head_dim];
+//     __shared__ float l_shared[Br];
+//     __shared__ float m_shared[Br];
 
-    __shared__ float back_k_tilda_shared[Bc * head_dim];
-    __shared__ float back_v_tilda_shared[Bc * head_dim];
-    __shared__ float back_q_shared[Br * head_dim];
-    __shared__ float back_o_shared[Br * head_dim];
+//     __shared__ float back_k_tilda_shared[Bc * head_dim];
+//     __shared__ float back_v_tilda_shared[Bc * head_dim];
+//     __shared__ float back_q_shared[Br * head_dim];
+//     __shared__ float back_o_shared[Br * head_dim];
 
-    int qkv_offset = (blockIdx.y * (n_head * sequence_length * head_dim)) + (blockIdx.x * (sequence_length * head_dim));
-    int lm_offset = (blockIdx.y * (n_head * sequence_length)) + (blockIdx.x * (sequence_length));
+//     __shared__ float back_S_shared[Br * Bc];
 
-    float *d_q_orig = d_q + qkv_offset;
-    float *d_k_orig = d_k + qkv_offset;
-    float *d_v_orig = d_v + qkv_offset;
-    float *d_o_orig = d_o + qkv_offset;
-    float *d_l_orig = d_l + lm_offset;
-    float *d_m_orig = d_m + lm_offset;
+//     int qkv_offset = (blockIdx.y * (n_head * sequence_length * head_dim)) + (blockIdx.x * (sequence_length * head_dim));
+//     int lm_offset = (blockIdx.y * (n_head * sequence_length)) + (blockIdx.x * (sequence_length));
 
-    float *back_q_orig = back_q + qkv_offset;
-    float *back_k_orig = back_k + qkv_offset;
-    float *back_v_orig = back_v + qkv_offset;
-    float *back_o_orig = back_o + qkv_offset;
+//     float *d_q_orig = d_q + qkv_offset;
+//     float *d_k_orig = d_k + qkv_offset;
+//     float *d_v_orig = d_v + qkv_offset;
+//     float *d_o_orig = d_o + qkv_offset;
+//     float *d_l_orig = d_l + lm_offset;
+//     float *d_m_orig = d_m + lm_offset;
 
-    for (int j = 0; j < T_c; j++){
+//     float *back_q_orig = back_q + qkv_offset;
+//     float *back_k_orig = back_k + qkv_offset;
+//     float *back_v_orig = back_v + qkv_offset;
+//     float *back_o_orig = back_o + qkv_offset;
 
-        for (int p1 = 0; p1 < head_dim; p1++){
+//     for (int j = 0; j < T_c; j++){
 
-            if (threadIdx.x < Bc) {
-                v_shared[threadIdx.x * head_dim + p1] = d_v[threadIdx.x * head_dim + p1];
-                k_shared[threadIdx.x * head_dim + p1] = d_k[threadIdx.x * head_dim + p1];
+//         for (int p1 = 0; p1 < head_dim; p1++){
 
-                back_k_tilda_shared[threadIdx.x * head_dim + p1] = 0.0;
-                back_v_tilda_shared[threadIdx.x * head_dim + p1] = 0.0;
+//             if (threadIdx.x < Bc) {
+//                 v_shared[threadIdx.x * head_dim + p1] = d_v[threadIdx.x * head_dim + p1];
+//                 k_shared[threadIdx.x * head_dim + p1] = d_k[threadIdx.x * head_dim + p1];
 
-            }
-        }
-        __syncthreads();
+//                 back_k_tilda_shared[threadIdx.x * head_dim + p1] = 0.0;
+//                 back_v_tilda_shared[threadIdx.x * head_dim + p1] = 0.0;
+
+//             }
+//         }
+//         __syncthreads();
         
 
-        d_q = d_q_orig;
-        d_o = d_o_orig;
-        d_l = d_l_orig;
-        d_m = d_m_orig;
+//         d_q = d_q_orig;
+//         d_o = d_o_orig;
+//         d_l = d_l_orig;
+//         d_m = d_m_orig;
 
-        back_q = back_q_orig;
-        back_o = back_o_orig;
+//         back_q = back_q_orig;
+//         back_o = back_o_orig;
 
-        for (int i = 0; i < T_r; i++){
+//         for (int i = 0; i < T_r; i++){
 
-            for (int a1 = 0; a1 < head_dim; a1++){
-                if (threadIdx.x < Bc) {
-                    q_shared[threadIdx.x * head_dim + a1] = d_q[threadIdx.x * head_dim + a1]; 
-                    o_shared[threadIdx.x * head_dim + a1] = d_o[threadIdx.x * head_dim + a1];
+//             for (int a1 = 0; a1 < head_dim; a1++){
+//                 if (threadIdx.x < Bc) {
+//                     q_shared[threadIdx.x * head_dim + a1] = d_q[threadIdx.x * head_dim + a1]; 
+//                     o_shared[threadIdx.x * head_dim + a1] = d_o[threadIdx.x * head_dim + a1];
 
-                    back_q_shared[threadIdx.x * head_dim + a1] = back_q[threadIdx.x * head_dim + a1];
-                    back_o_shared[threadIdx.x * head_dim + a1] = back_o[threadIdx.x * head_dim + a1];
-                }
+//                     back_q_shared[threadIdx.x * head_dim + a1] = back_q[threadIdx.x * head_dim + a1];
+//                     back_o_shared[threadIdx.x * head_dim + a1] = back_o[threadIdx.x * head_dim + a1];
+//                 }
 
-            }
-            if (threadIdx.x < Bc) {
-                l_shared[threadIdx.x] = d_l[threadIdx.x];
-                m_shared[threadIdx.x] = d_m[threadIdx.x];
-            }
-            __syncthreads();
+//             }
+//             if (threadIdx.x < Bc) {
+//                 l_shared[threadIdx.x] = d_l[threadIdx.x];
+//                 m_shared[threadIdx.x] = d_m[threadIdx.x];
+//             }
+//             __syncthreads();
 
-            float S[Bc]; 
-            float S_masked[Bc];
-            float back_S[Bc];
-            float m_tilda = -INFINITY;
-            for (int w1 = 0; w1 < Bc; w1++){
-                float tmp = 0.0;
-                for (int e1 = 0; e1 < head_dim; e1 ++){
-                    tmp += q_shared[threadIdx.x * head_dim + e1] * k_shared[w1 * head_dim + e1];
-                }
-                S[w1] = tmp * softmax_scale;
+//             float S[Bc]; 
+//             float S_masked[Bc];
+//             float back_S[Bc];
+//             float m_tilda = -INFINITY;
+//             for (int w1 = 0; w1 < Bc; w1++){
+//                 float tmp = 0.0;
+//                 for (int e1 = 0; e1 < head_dim; e1 ++){
+//                     tmp += q_shared[threadIdx.x * head_dim + e1] * k_shared[w1 * head_dim + e1];
+//                 }
+//                 S[w1] = tmp * softmax_scale;
 
-            for (int h = 0; h < Bc; h++){
-                if (j < i || (j == i && h <= threadIdx.x)){  
-                    S_masked[h] = S[h];
-                } else {
-                    S_masked[h] = -INFINITY;
-                }
-            }
+//             for (int h = 0; h < Bc; h++){
+//                 if (j < i || (j == i && h <= threadIdx.x)){  
+//                     S_masked[h] = S[h];
+//                 } else {
+//                     S_masked[h] = -INFINITY;
+//                 }
+//             }
             
-            float P[Bc]; 
-            float back_P[Bc];
-            float l_tilda = 0.0; 
-            for (int f1 =0; f1 < Bc; f1++){
-                float diff = S_masked[f1] - m_shared[threadIdx.x]; 
-                P_tilda[f1] =  (1 / d_l[threadIdx.x]) * (exp(diff) - d_m[threadIdx.x]); 
-            }
-            __syncthreads();
+//             float P[Bc]; 
+//             float P_tilda[Bc];
+//             float back_P[Bc];
+//             float l_tilda = 0.0; 
+//             for (int f1 =0; f1 < Bc; f1++){
+//                 float diff = S_masked[f1] - m_shared[threadIdx.x]; 
+//                 P_tilda[f1] =  (1 / d_l[threadIdx.x]) * (exp(diff) - d_m[threadIdx.x]); 
+//             }
+//             __syncthreads();
 
-            for (int l = 0; l < head_dim; l++){
-                float tmp2 = 0.0;
-                for (int t = 0; t < Br; t++){
-                    tmp2 += P[t * Bc + threadIdx.x] * back_o[t * d + l];
-                }
-                back_v_tilda_shared[threadIdx.x * d + l] += tmp2;
-            }
+//             for (int l = 0; l < head_dim; l++){
+//                 float tmp2 = 0.0;
+//                 for (int t = 0; t < Br; t++){
+//                     tmp2 += P_tilda[t * Bc + threadIdx.x] * back_o[t * head_dim + l];
+//                 }
+//                 back_v_tilda_shared[threadIdx.x * head_dim + l] += tmp2;
+//             }
 
-            for (int n = 0; n < Bc; n++){
-                float tmp3 = 0.0;
-                for (int y = 0; y < head_dim; y++){
-                    tmp3 += back_o_shared[threadIdx.x * d + y] * v_shared[n * d + y];
-                }
-                // back_P[threadIdx.x * Bc + n] = tmp3;
-                back_P[n] = tmp3;
-            }
+//             for (int n = 0; n < Bc; n++){
+//                 float tmp3 = 0.0;
+//                 for (int y = 0; y < head_dim; y++){
+//                     tmp3 += back_o_shared[threadIdx.x * head_dim + y] * v_shared[n * head_dim + y];
+//                 }
+//                 // back_P[threadIdx.x * Bc + n] = tmp3;
+//                 back_P[n] = tmp3;
+//             }
 
-            float D[Br];
-            float tmp4 = 0.0;
-            for (int h = 0; h < head_dim; h++){
-                tmp4 += back_o_shared[threadIdx.x * d + h] * o_shared[threadIdx.x * d + h];
-            }
-            D[threadIdx.x] = tmp4;
-            }
+//             float D[Br];
+//             float tmp4 = 0.0;
+//             for (int h = 0; h < head_dim; h++){
+//                 tmp4 += back_o_shared[threadIdx.x * head_dim + h] * o_shared[threadIdx.x * head_dim + h];
+//             }
+//             D[threadIdx.x] = tmp4;
+//             }
             
-            for (int f = 0; f < Bc; f++){
-                // back_S[threadIdx.x * Bc + f] = d_P[threadIdx.x * Bc + f] * (back_P[threadIdx.x * Bc + f] - D[threadIdx.x]);
-                back_S[f] = d_P[threadIdx.x * Bc + f] * (back_P[threadIdx.x * Bc + f] - D[threadIdx.x]);
-            }
-            __syncthreads();
+//             for (int f = 0; f < Bc; f++){
+//                 // back_S[threadIdx.x * Bc + f] = d_P[threadIdx.x * Bc + f] * (back_P[threadIdx.x * Bc + f] - D[threadIdx.x]);
+//                 back_S[f] = P_tilda[threadIdx.x * Bc + f] * (back_P[threadIdx.x * Bc + f] - D[threadIdx.x]);
+//             }
+//             __syncthreads();
 
-            for (int o = 0; o < head_dim; o++){
-                float tmp5 = 0.0;
-                for (int g = 0; g < Bc; g++){
-                    // tmp5 += back_S[threadIdx.x * Bc + g] * k_shared[g * d + o];
-                    tmp5 += back_S[g] * k_shared[g * d + o];
-                }
-                back_q_shared[threadIdx.x * d + o] += tmp5 * softmax_scale;
-                back_q[threadIdx.x * d + o] =  back_q_shared[threadIdx.x * d + o];
-            }
+//             for (int o = 0; o < head_dim; o++){
+//                 float tmp5 = 0.0;
+//                 for (int g = 0; g < Bc; g++){
+//                     // tmp5 += back_S[threadIdx.x * Bc + g] * k_shared[g * d + o];
+//                     tmp5 += back_S[g] * k_shared[g * head_dim + o];
+//                 }
+//                 back_q_shared[threadIdx.x * head_dim + o] += tmp5 * softmax_scale;
+//                 back_q[threadIdx.x * head_dim + o] =  back_q_shared[threadIdx.x * head_dim + o];
+//             }
 
-            for (int t = 0; t < head_dim; t++){
-                float tmp6 = 0.0;
-                for (int z = 0; z < Bc; z++){
-                    // tmp6 += back_S[z * Bc + threadIdx.x] * q_shared[z * d + t];
-                    tmp6 += back_S[z * Bc + threadIdx.x] * q_shared[z * d + t];
-                }
-                back_k_tilda_shared[threadIdx.x * d + t] += tmp6 * softmax_scale;
-            }
-            __syncthreads();
+//             for (int t = 0; t < head_dim; t++){
+//                 float tmp6 = 0.0;
+//                 for (int z = 0; z < Bc; z++){
+//                     // tmp6 += back_S[z * Bc + threadIdx.x] * q_shared[z * d + t];
+//                     tmp6 += back_S[z * Bc + threadIdx.x] * q_shared[z * head_dim + t];
+//                 }
+//                 back_k_tilda_shared[threadIdx.x * head_dim + t] += tmp6 * softmax_scale;
+//             }
+//             __syncthreads();
 
-            if ((i+1) != T_r){
-                d_q += Br * head_dim;
-                d_o += Br * head_dim;
-                d_l += Br;
-                d_m += Br;
+//             if ((i+1) != T_r){
+//                 d_q += Br * head_dim;
+//                 d_o += Br * head_dim;
+//                 d_l += Br;
+//                 d_m += Br;
 
-                back_q += Br * head_dim;
-                back_o += Br * head_dim;
-            }
+//                 back_q += Br * head_dim;
+//                 back_o += Br * head_dim;
+//             }
 
 
-        }                   
-        for (int g = 0; g < head_dim; g++){
-            back_k[threadIdx.x * d + g] = back_k_tilda_shared[threadIdx.x * d + g];
-            back_v[threadIdx.x * d + g] = back_v_tilda_shared[threadIdx.x * d + g];
-        }   
+//         }                   
+//         for (int g = 0; g < head_dim; g++){
+//             back_k[threadIdx.x * head_dim + g] = back_k_tilda_shared[threadIdx.x * head_dim + g];
+//             back_v[threadIdx.x * head_dim + g] = back_v_tilda_shared[threadIdx.x * head_dim + g];
+//         }   
 
-        __syncthreads();
-        if ((j+1) != T_c){
-            d_k += Bc * head_dim;
-            d_v += Bc * head_dim;
+//         __syncthreads();
+//         if ((j+1) != T_c){
+//             d_k += Bc * head_dim;
+//             d_v += Bc * head_dim;
 
-            back_k += Bc * head_dim;
-            back_v += Bc * head_dim;
-        }
+//             back_k += Bc * head_dim;
+//             back_v += Bc * head_dim;
+//         }
 
-    }
-}
-
+//     }
+// }
 
 void init_matrix(float *mat, int bs, int n_h, int s_l, int h_d){
     for (int i = 0; i < bs; i++) {
@@ -572,10 +586,6 @@ int main(){
                         mismatches++;
                         correct = false;
                     }
-                    // if (i==j && j==k && k==l){
-                    //     printf("multi_attn=%.6f\n",h_o_cpu[index]);
-                    //     printf("flash_attn=%.6f\n",h_o[index]);
-                    // }
                     
                 }
             }
