@@ -77,13 +77,42 @@ __global__ void multi_head_attention(float *d_q, float *d_k, float *d_v, float *
 }
 
 __global__ void flash_attn_kernel_2(float *d_q, float *d_k, float *d_v, float *d_o, float *d_l, float *d_m){
-    __shared__ float k_shared[Bc * head_dim];
-    __shared__ float v_shared[Bc * head_dim];
-    __shared__ float q_shared[Br * head_dim];
-    __shared__ float o_shared[Br * head_dim];
-    __shared__ float l_shared[Br];
-    __shared__ float m_shared[Br];
-    __shared__ float s_shared[Br * Bc];
+    // extern __shared__ float smem[];
+    // float *k_shared = smem;
+    // float *v_shared = k_shared + Bc * head_dim;
+    // float *q_shared = v_shared + Bc * head_dim;  
+    // float *o_shared = q_shared + Br * head_dim;
+    // float *l_shared = o_shared + Br * head_dim;
+    // float *m_shared = l_shared + Br;
+    // float *s_shared = m_shared + Br;
+
+    extern __shared__ float smem[];
+    
+    // Calculate sizes
+    int k_size = Bc * head_dim;
+    int v_size = Bc * head_dim;
+    int q_size = Br * head_dim;
+    int o_size = Br * head_dim;
+    int l_size = Br;
+    int m_size = Br;
+    int s_size = Br * Bc;
+    
+    // Assign pointers with running offset
+    float *k_shared = smem;
+    float *v_shared = k_shared + k_size;
+    float *q_shared = v_shared + v_size;
+    float *o_shared = q_shared + q_size;
+    float *l_shared = o_shared + o_size;
+    float *m_shared = l_shared + l_size;
+    float *s_shared = m_shared + m_size;
+    
+    // __shared__ float k_shared[Bc * head_dim];
+    // __shared__ float v_shared[Bc * head_dim];
+    // __shared__ float q_shared[Br * head_dim];
+    // __shared__ float o_shared[Br * head_dim];
+    // __shared__ float l_shared[Br];
+    // __shared__ float m_shared[Br];
+    // __shared__ float s_shared[Br * Bc];
 
     const float eps = 1e-6f;  
 
@@ -229,8 +258,6 @@ __global__ void flash_attn_kernel_2(float *d_q, float *d_k, float *d_v, float *d
 
 
 
-
-
 void init_matrix(float *mat, int bs, int n_h, int s_l, int h_d){
     for (int i = 0; i < bs; i++) {
         for (int j = 0; j < n_h; j++) {
@@ -325,36 +352,42 @@ int main(){
 
     printf("Benchmarking multi_attn implementation...\n");
     double cpu_total_time = 0.0;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 5; i++) {
         double start_time = get_time();
         multi_head_attention<<<dimGrid_mha, dimBlock_mha>>>(d_q, d_k, d_v, d_S, d_P, d_o_gpu);
         cudaDeviceSynchronize();
         double end_time = get_time();
         cpu_total_time += end_time - start_time;
     }
-    double cpu_avg_time = cpu_total_time / 20.0;
+    double cpu_avg_time = cpu_total_time / 5.0;
 
     CUDA_CHECK(cudaMemcpy(h_o_cpu, d_o_gpu, o_size, cudaMemcpyDeviceToHost));
 
     dim3 dimGrid_flash(T_r, batch_size * n_head);
     dim3 dimBlock_flash(Bc);
 
+    size_t shared_mem_size = (Bc * head_dim +  Bc * head_dim + Br * head_dim + Br * head_dim + Br + Br + Br * Bc) * sizeof(float);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    printf("Max shared memory per block: %zu bytes\n", prop.sharedMemPerBlock);
+    printf("Required shared memory per block for fa kernel: %zu bytes\n", shared_mem_size);
+
     printf("Performing flash_attn warmup runs...\n");
     for (int i=0; i<2; i++){
-        flash_attn_kernel_2<<<dimGrid_flash, dimBlock_flash>>>(d_q, d_k, d_v, d_o, d_l, d_m);
+        flash_attn_kernel_2<<<dimGrid_flash, dimBlock_flash, shared_mem_size>>>(d_q, d_k, d_v, d_o, d_l, d_m);
         cudaDeviceSynchronize();
     }
 
     printf("Benchmarking flash_attn implementation...\n");
     double gpu_total_time = 0.0;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 5; i++) {
         double start_time = get_time();
-        flash_attn_kernel_2<<<dimGrid_flash, dimBlock_flash>>>(d_q, d_k, d_v, d_o, d_l, d_m);
+        flash_attn_kernel_2<<<dimGrid_flash, dimBlock_flash, shared_mem_size>>>(d_q, d_k, d_v, d_o, d_l, d_m);
         cudaDeviceSynchronize();
         double end_time = get_time();
         gpu_total_time += end_time - start_time;
     }
-    double gpu_avg_time = gpu_total_time / 20.0;
+    double gpu_avg_time = gpu_total_time / 5.0;
 
     printf("mutli-head attn avg time: %.2f milliseconds\n", cpu_avg_time * 1000);
     printf("flash attn avg time: %.2f milliseconds\n", gpu_avg_time * 1000);
