@@ -46,15 +46,15 @@ __global__ void multi_head_attention(float *d_q, float *d_k, float *d_v, float *
         for (int k1 = 0; k1 < head_dim; k1++){
             tmp += d_q[threadIdx.x * head_dim + k1] * d_k[w1 * head_dim + k1];
         }
-        d_S[threadIdx.x * sequence_length + w1] = tmp * softmax_scale;
+        d_S[threadIdx.x * sequence_length + w1] = tmp  * softmax_scale;
     }
     __syncthreads();
 
-    for (int h = 0; h < sequence_length; h++){
-        if (h > threadIdx.x) {
-            d_S[threadIdx.x * sequence_length + h] = -INFINITY;
-        }
-    }
+    // for (int h = 0; h < sequence_length; h++){
+    //     if (h > threadIdx.x) {
+    //         d_S[threadIdx.x * sequence_length + h] = -INFINITY;
+    //     }
+    // }
 
     float denominator = 0.0;
     for (int l1 = 0; l1 < sequence_length; l1++){
@@ -77,23 +77,6 @@ __global__ void multi_head_attention(float *d_q, float *d_k, float *d_v, float *
 }
 
 __global__ void flash_attn_kernel_2(float *d_q, float *d_k, float *d_v, float *d_o, float *d_l, float *d_m){
-    // extern __shared__ float smem[];
-    // float *q_shared = smem;
-    // float *k_shared = q_shared + Br * head_dim;
-    // float *v_shared = k_shared + Bc * head_dim;
-    // float *s_shared = v_shared + Bc * head_dim;
-    // float *o_shared = s_shared + Br * Bc;
-    // float *l_shared = o_shared + Br * head_dim;
-    // float *m_shared = l_shared + Br;
-
-    // extern __shared__ float smem[];
-    // float *q_shared = smem;                           // Size: Br * head_dim
-    // float *k_shared = q_shared + Br * head_dim;      // Size: Bc * head_dim  
-    // float *v_shared = k_shared + Bc * head_dim;      // Size: Bc * head_dim
-    // float *s_shared = v_shared + Bc * head_dim;      // Size: Br * Bc (FIXED!)
-    // float *o_shared = s_shared + Br * Bc;            // Size: Br * head_dim (FIXED!)
-    // float *l_shared = o_shared + Br * head_dim;      // Size: Br (FIXED!)
-    // float *m_shared = l_shared + Br;   
     __shared__ float k_shared[Bc * head_dim];
     __shared__ float v_shared[Bc * head_dim];
     __shared__ float q_shared[Br * head_dim];
@@ -102,7 +85,9 @@ __global__ void flash_attn_kernel_2(float *d_q, float *d_k, float *d_v, float *d
     __shared__ float m_shared[Br];
     __shared__ float s_shared[Br * Bc];
 
-    int q_offset = (blockIdx.y * (sequence_length * head_dim)) + (blockIdx.x * (Br * head_dim));
+    const float eps = 1e-6f;  
+
+    int q_offset  = (blockIdx.y * (sequence_length * head_dim)) + (blockIdx.x * (Br * head_dim));
     int kv_offset = (blockIdx.y * (sequence_length * head_dim));
     int lm_offset = (blockIdx.y * (sequence_length)) + (blockIdx.x * (Br));
 
@@ -120,92 +105,130 @@ __global__ void flash_attn_kernel_2(float *d_q, float *d_k, float *d_v, float *d
     d_l = d_l_orig;
     d_m = d_m_orig;
 
+    // Load q and init o with proper bounds checking
     for (int a1 = 0; a1 < head_dim; a1++){
-        if (threadIdx.x < Bc) {
+        if (threadIdx.x < Br && (blockIdx.x * Br + threadIdx.x) < sequence_length) {
             q_shared[threadIdx.x * head_dim + a1] = d_q[threadIdx.x * head_dim + a1]; 
-            o_shared[threadIdx.x * head_dim + a1] = d_o[threadIdx.x * head_dim + a1];
+            o_shared[threadIdx.x * head_dim + a1] = 0.0f; // Initialize to 0
         }
     }
 
-    if (threadIdx.x < Bc) {
-        l_shared[threadIdx.x] = d_l[threadIdx.x];
-        m_shared[threadIdx.x] = d_m[threadIdx.x];
+    // Init l and m safely
+    if (threadIdx.x < Br) {
+        l_shared[threadIdx.x] = 0.0f;
+        m_shared[threadIdx.x] = -INFINITY;
     }
-
-    float prev_m_tilda = -INFINITY;
+    __syncthreads();
 
     for (int j = 0; j < T_c; j++){
+        // Load K and V tile
         for (int p1 = 0; p1 < head_dim; p1++){
-            if (threadIdx.x < Bc) {
+            if (threadIdx.x < Bc && (j * Bc + threadIdx.x) < sequence_length) {
                 v_shared[threadIdx.x * head_dim + p1] = d_v[threadIdx.x * head_dim + p1];
                 k_shared[threadIdx.x * head_dim + p1] = d_k[threadIdx.x * head_dim + p1];
             }
         }
+        __syncthreads();
 
-        // float m_tilda = -INFINITY;
-        // float S[Bc]; 
-        // float S_masked[Bc];
-        prev_m_tilda = m_shared[threadIdx.x];
-        for (int w1 = 0; w1 < Bc; w1++){
-            float tmp = 0.0;
-            int i = blockIdx.x;
-            if (j < i || (j == i && w1 <= threadIdx.x)){
-                for (int e1 = 0; e1 < head_dim; e1 ++){
+        // Only process if thread is within Br range
+        if (threadIdx.x < Br && (blockIdx.x * Br + threadIdx.x) < sequence_length) {
+            float prev_m_tilda = m_shared[threadIdx.x];
+
+            // Compute scores
+            for (int w1 = 0; w1 < Bc && (j * Bc + w1) < sequence_length; w1++){
+                float tmp = 0.0f;
+                for (int e1 = 0; e1 < head_dim; e1++){
                     tmp += q_shared[threadIdx.x * head_dim + e1] * k_shared[w1 * head_dim + e1];     
                 }
-                s_shared[threadIdx.x * Bc + w1] = tmp * softmax_scale;
+                s_shared[threadIdx.x * Bc + w1] = tmp  * softmax_scale;
                 m_shared[threadIdx.x] = fmaxf(m_shared[threadIdx.x], s_shared[threadIdx.x * Bc + w1]);
+            }
+
+
+
+            // Compute softmax numerically stable
+            float P_tilda[Bc]; 
+            float summ = 0.0f;
+            for (int f1 = 0; f1 < Bc && (j * Bc + f1) < sequence_length; f1++){
+                float diff = s_shared[threadIdx.x * Bc + f1] - m_shared[threadIdx.x]; 
+                float exp_val = expf(diff);
+                P_tilda[f1] = exp_val;
+                summ += exp_val;
+            }
+            // Zero out padding positions
+            for (int f1 = max(0, (int)(sequence_length - j * Bc)); f1 < Bc; f1++) {
+                P_tilda[f1] = 0.0f;
+            }
+
+            // Update normalization denominator
+            if (j == 0) {
+                l_shared[threadIdx.x] = summ;
             } else {
-                s_shared[threadIdx.x * Bc + w1] = -INFINITY;
+                float exp_val = expf(prev_m_tilda - m_shared[threadIdx.x]);
+                if (exp_val < eps) exp_val = eps; // prevent numerical issues
+                l_shared[threadIdx.x] = exp_val * l_shared[threadIdx.x] + summ;
             }
 
-        float P_tilda[Bc]; 
-        float summ = 0.0;
-        for (int f1 =0; f1 < Bc; f1++){
-            float diff = s_shared[threadIdx.x * Bc + f1] - m_shared[threadIdx.x] ; 
-            P_tilda[f1] = exp(diff); 
-            summ += P_tilda[f1];
+            for (int g1 = 0; g1 < head_dim; g1++){
+                float updated_output = 0.0f;
+                if (j == 0) {
+                    float tmp = 0.0f;
+                    for (int v1 = 0; v1 < Bc && (j * Bc + v1) < sequence_length; v1++){
+                        tmp += P_tilda[v1] * v_shared[v1 * head_dim + g1];
+                    }
+                    updated_output = tmp;
+                } else {
+                    // Subsequent iterations: apply exponential correction
+                    float exp_val = expf(prev_m_tilda - m_shared[threadIdx.x]);
+                    if (exp_val < eps) exp_val = eps;
+                    
+                    float first_term = exp_val * o_shared[threadIdx.x * head_dim + g1];
+                    float tmp = 0.0f;
+                    for (int v1 = 0; v1 < Bc && (j * Bc + v1) < sequence_length; v1++){
+                        tmp += P_tilda[v1] * v_shared[v1 * head_dim + g1];
+                    }
+                    updated_output = first_term + tmp;
+                }
+                
+                o_shared[threadIdx.x * head_dim + g1] = updated_output;
+            }
         }
-
-        __syncthreads();
-
-        l_shared[threadIdx.x] = exp(prev_m_tilda - m_shared[threadIdx.x]) * l_shared[threadIdx.x] + summ;
-
-        for (int g1 = 0; g1 < head_dim; g1++){
-            float first_term = 1 / (exp(prev_m_tilda - m_shared[threadIdx.x])) * o_shared[threadIdx.x * head_dim + g1];
-            float tmp = 0.0;
-            for (int v1 = 0; v1 < Bc; v1++){
-                tmp += P_tilda[v1] * v_shared[v1 * head_dim + g1];
-            }
         
-            o_shared[threadIdx.x * head_dim + g1] = (first_term + tmp);
-        }
         __syncthreads();
+
+        // Move to next K, V tiles
         if ((j+1) != T_c){
             d_k += Bc * head_dim;
             d_v += Bc * head_dim;
         }
-        
-        // d_o += Br * head_dim;
-        // d_l += Br;
-        // d_m += Br;
-        
     }
-    for (int l1 = 0; l1 < head_dim; l1++){
-        if (threadIdx.x < Br) { 
-            o_shared[threadIdx.x * head_dim + l1] = (1 / l_shared[threadIdx.x]) * o_shared[threadIdx.x * head_dim + l1];
-            d_o[threadIdx.x * head_dim + l1] = o_shared[threadIdx.x * head_dim + l1];
+
+    // Final normalization and write to global memory
+    if (threadIdx.x < Br && (blockIdx.x * Br + threadIdx.x) < sequence_length) {
+        for (int l1 = 0; l1 < head_dim; l1++){
+            float denom = l_shared[threadIdx.x];
+            if (denom < eps) denom = eps; // avoid div by zero
+            
+            float val = o_shared[threadIdx.x * head_dim + l1] / denom;
+            d_o[threadIdx.x * head_dim + l1] = val;
+        }
+
+        // Store log-sum-exp part safely
+        float l_val = l_shared[threadIdx.x];
+        if (l_val > eps) {
+            d_l[threadIdx.x] = m_shared[threadIdx.x] + logf(l_val);
+            d_m[threadIdx.x] = m_shared[threadIdx.x];
+        } else {
+            d_l[threadIdx.x] = -INFINITY;
+            d_m[threadIdx.x] = -INFINITY;
         }
     }
 
-    d_l[threadIdx.x] = m_shared[threadIdx.x] + log(l_shared[threadIdx.x]);
-    }
     __syncthreads();
-    
-    d_o = d_o_orig;
-    d_l = d_l_orig;
-    d_m = d_m_orig;
 }
+
+
+
 
 
 void init_matrix(float *mat, int bs, int n_h, int s_l, int h_d){
@@ -316,13 +339,6 @@ int main(){
     dim3 dimGrid_flash(T_r, batch_size * n_head);
     dim3 dimBlock_flash(Bc);
 
-    // printf("Host: d_o address = %p\n", (void*)d_o);
-    // flash_attn_kernel_2<<<dimGrid_flash, dimBlock_flash>>>(d_q, d_k, d_v, d_o, d_l, d_m);
-    // CUDA_CHECK(cudaGetLastError());
-    // printf("Host: d_o address after launch = %p\n", (void*)d_o);
-    // cudaDeviceSynchronize();
-    // printf("Host: d_o address after sync = %p\n", (void*)d_o);
-
     printf("Performing flash_attn warmup runs...\n");
     for (int i=0; i<2; i++){
         flash_attn_kernel_2<<<dimGrid_flash, dimBlock_flash>>>(d_q, d_k, d_v, d_o, d_l, d_m);
@@ -355,7 +371,7 @@ int main(){
             for (int k = 0; k < sequence_length; k++){
                 for (int l = 0; l < head_dim; l++){
                     int index = (i * (n_head * sequence_length * head_dim)) + (j * (sequence_length * head_dim)) + (k * (head_dim)) + l;
-                    if (fabs(h_o_cpu[index] - h_o[index]) > 1e-3) {
+                    if (isnan(h_o[index]) || isnan(h_o_cpu[index]) ||fabs(h_o_cpu[index] - h_o[index]) > 1e-3) {
                         printf("Mismatch at [%d][%d]: multi_attn=%.6f, flash_attn=%.6f\n", i, j, h_o_cpu[index], h_o[index]);
                         mismatches++;
                         correct = false;

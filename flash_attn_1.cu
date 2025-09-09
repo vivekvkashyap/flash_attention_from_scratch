@@ -101,15 +101,15 @@ __global__ void multi_head_attention(float *d_q, float *d_k, float *d_v, float *
         for (int k1 = 0; k1 < head_dim; k1++){
             tmp += d_q[threadIdx.x * head_dim + k1] * d_k[w1 * head_dim + k1];
         }
-        d_S[threadIdx.x * sequence_length + w1] = tmp * softmax_scale;
+        d_S[threadIdx.x * sequence_length + w1] = tmp;// * softmax_scale;
     }
     __syncthreads();
 
-    for (int h = 0; h < sequence_length; h++){
-        if (h > threadIdx.x) {
-            d_S[threadIdx.x * sequence_length + h] = -INFINITY;
-        }
-    }
+    // for (int h = 0; h < sequence_length; h++){
+    //     if (h > threadIdx.x) {
+    //         d_S[threadIdx.x * sequence_length + h] = -INFINITY;
+    //     }
+    // }
 
     float denominator = 0.0;
     for (int l1 = 0; l1 < sequence_length; l1++){
@@ -198,21 +198,22 @@ __global__ void flash_attn_kernel_1(float *d_q, float *d_k, float *d_v, float *d
                 for (int e1 = 0; e1 < head_dim; e1 ++){
                     tmp += q_shared[threadIdx.x * head_dim + e1] * k_shared[w1 * head_dim + e1];
                 }
-                S[w1] = tmp * softmax_scale;
+                S[w1] = tmp;// * softmax_scale;
+                m_tilda = fmaxf(m_tilda, S[w1]);
 
-            for (int h = 0; h < Bc; h++){
-                if (j < i || (j == i && h <= threadIdx.x)){  
-                    S_masked[h] = S[h];
-                } else {
-                    S_masked[h] = -INFINITY;
-                }
-                m_tilda = fmaxf(m_tilda, S_masked[h]);
-            }
+            // for (int h = 0; h < Bc; h++){
+            //     if (j < i || (j == i && h <= threadIdx.x)){  
+            //         S_masked[h] = S[h];
+            //     } else {
+            //         S_masked[h] = -INFINITY;
+            //     }
+            //     m_tilda = fmaxf(m_tilda, S_masked[h]);
+            // }
 
             float P_tilda[Bc]; 
             float l_tilda = 0.0; 
             for (int f1 =0; f1 < Bc; f1++){
-                float diff = S_masked[f1] - m_tilda; 
+                float diff = S[f1] - m_tilda; 
                 P_tilda[f1] = exp(diff); 
                 l_tilda += P_tilda[f1];
 
@@ -581,7 +582,8 @@ int main(){
             for (int k = 0; k < sequence_length; k++){
                 for (int l = 0; l < head_dim; l++){
                     int index = (i * (n_head * sequence_length * head_dim)) + (j * (sequence_length * head_dim)) + (k * (head_dim)) + l;
-                    if (fabs(h_o_cpu[index] - h_o[index]) > 1e-3) {
+                    printf("CPU: %f\n, GPU: %f\n", h_o_cpu[index], h_o[index]);
+                    if (isnan(h_o[index]) || isnan(h_o_cpu[index]) ||fabs(h_o_cpu[index] - h_o[index]) > 1e-3) {
                         printf("Mismatch at [%d][%d]: multi_attn=%.6f, flash_attn=%.6f\n", i, j, h_o_cpu[index], h_o[index]);
                         mismatches++;
                         correct = false;
